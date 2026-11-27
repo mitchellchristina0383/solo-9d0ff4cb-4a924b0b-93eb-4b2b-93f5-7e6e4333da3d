@@ -1,5 +1,134 @@
 # 实测报告
 
+## 2026-11-27 复现号 / JSON 包 / 隔离重放增量
+
+### 新增实现
+
+1. `app/scheduler.py`
+   - 新增当前轮操作日志 `_journal`，在调度锁内记录实际生效顺序：
+     成功的 `create_workspace`、`submit_build`、`cancel_build` 和每一拍
+     `tick`；失败的重复创建、非法提交、非法取消不记录。
+   - `/advance` 保持“逐拍取锁”，并给同一批 tick 写入相同 `batch_id` 与
+     `batch_index`；其他请求在拍间插入时，其日志序号自然位于两拍之间。
+   - 环检测新增结构化路径：两节点环为
+     `["A","ws-2","B","ws-1","A"]`，三节点环为
+     `["A","ws-2","B","ws-3","C","ws-1","A"]`；同时返回
+     `cycle_ring.build_ids/workspace_ids/nodes/edges`。
+   - 报环 tick 获得全局递增、重置后不复用的 `reproduction_id`
+     （同时提供 `repro_id` / `replay_id`）。`reset()` 清空当前轮复现号，
+     旧号再下载返回 `ReproductionNotFound` → HTTP 404。
+   - 每个复现号保存自己的故障拍日志截止序号；同轮多个报环共享一份 journal，
+     下载包只包含到该号故障拍为止的操作。
+   - 包内包含初始工作区、有序操作、便捷投影、失败构建快照、环路径/结构、
+     最后一拍完整结果。
+   - 修复一个边界：若构建的最后一步是阻塞 `acquire`，之后被授予工作区，
+     现在会在授予时立即完成并释放资源，避免下一拍 `pc == len(steps)`。
+2. `app/replay.py`（新文件）
+   - `replay_package()` 总是创建独立 `Scheduler()`，按包内原规则执行。
+   - 支持直接包、`{package|bundle|data: ...}` 信封，以及若干常见别名字段。
+   - 核对最后一拍的 tick、cycle、失败构建、工作区、环路径和完整结果字段；
+     复现号本身因演练实例独立发号而忽略。
+   - 成功/失败均返回 `matched`（以及 `match/ok/success/reproduced` 等别名）、
+     `failed_build_id`、`cycle_path/cycle/ring`、结构化环、最后一拍、
+     隔离演练自己的 `snapshot/events`。
+   - 默认 mismatch 为 HTTP 200 + `matched=false`；`?strict=true` 时为 409。
+3. `app/main.py`
+   - 新增 `GET /reproductions`、
+     `GET /reproductions/{id}`、
+     `GET /reproductions/{id}/package`、
+     `POST /reproductions/{id}/replay`、
+     `POST /replay`、`GET /journal`。
+   - 下载路由设置 `Content-Disposition: attachment; filename=...json`。
+   - 为常见命名增加 `/repro/...`、`/repros/...`、
+     `/reproduction-packages/...`、`/replay-package`、`/api/replay`
+     等隐藏兼容别名。
+4. `tests/test_reproduction.py`（新文件，8 个用例）和
+   `scripts/repro_demo.py`（新 HTTP 演练）。
+
+### 最新自动化测试
+
+命令：
+
+```bash
+PYTHONPATH=/workspace/.pylibs python3 -m pytest tests/ -v
+```
+
+结果：
+
+```text
+25 passed, 1 warning in 4.69s
+```
+
+新增 8 个用例全部通过：
+
+```text
+test_cycle_tick_gets_reproduction_number_and_ordered_package PASSED
+test_advance_batch_cycle_result_carries_reproduction_number PASSED
+test_package_includes_only_successful_creates_submissions_and_cancels PASSED
+test_interleaved_batch_is_journaled_in_effective_tick_order PASSED
+test_multiple_cycles_share_journal_but_packages_stop_at_their_fault PASSED
+test_replay_downloaded_package_then_reset_invalidates_number_but_not_json PASSED
+test_replay_mismatch_is_reported PASSED
+test_three_node_cycle_package_replays_long_ring PASSED
+```
+
+原 17 个调度器用例也全部保持通过。
+
+### 真实 HTTP 试跑
+
+本地用 uvicorn 启动（依赖安装在 `/workspace/.pylibs`）：
+
+```bash
+PYTHONPATH=/workspace/.pylibs \
+  python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+PYTHONPATH=/workspace/.pylibs \
+  python3 scripts/repro_demo.py http://127.0.0.1:8000 /tmp/ci-repro-demo
+```
+
+实测输出：
+
+```text
+=== interleaved /advance batch ===
+journal entries=10041, ticks=10000, creates=40, inserts_between_ticks=12
+example interleaved operation seq=3020
+
+=== cycle reproduction package ===
+reproduction number: repro-000001
+cycle path: A -> ws-2 -> B -> ws-1 -> A
+downloaded package: /tmp/ci-repro-demo/repro-000001.json (62149 bytes)
+pre-reset replay: matched=true, failed_build_id=A
+replay did not change live snapshot
+after reset, old reproduction number: HTTP 404
+saved JSON replay after reset: matched=true
+live scheduler still advances: fresh=completed
+
+REPRO DEMO OK
+```
+
+说明：第一次 HTTP 交错试跑时多线程共用一个 `httpx.Client`，客户端连接池把
+请求串行化，导致插入都落在批量前后；改为每个插入请求使用独立 HTTP 客户端后，
+实际观察到 12 个创建操作落在两拍之间。确定性的“批量中插入”由
+`test_interleaved_batch_is_journaled_in_effective_tick_order` 包装 tick
+验证，不依赖线程调度运气。
+
+另外实测：
+
+- `GET /docs` → HTTP 200；
+- `GET /openapi.json` 包含 `/replay` 和 `/reproductions/...`；
+- `python3 -m py_compile app/*.py scripts/repro_demo.py` 通过；
+- `docker-compose.yml` 经 PyYAML 解析，服务端口仍为 `8000:8000`。
+
+### 本轮余项
+
+- 沙箱内没有 `docker` CLI / Compose 插件 / 容器守护进程，未能实际执行
+  `docker compose up --build`；这是部署验证余项。Dockerfile 无需增加依赖或
+  文件复制指令，因为 `COPY app ./app` 已包含 `app/replay.py`。
+- 复现号和当前轮 journal 为内存态；进程重启失效。已下载 JSON 可继续重放。
+
+---
+
+## 以下为基线报告（17 个原始用例）
+
 环境：Python 3.11.2、FastAPI 0.165.0、uvicorn 0.54.0、pytest 9.2.0（依赖安装
 在仓库外的独立目录 `.pylibs/`，通过 `PYTHONPATH` 引用）。
 

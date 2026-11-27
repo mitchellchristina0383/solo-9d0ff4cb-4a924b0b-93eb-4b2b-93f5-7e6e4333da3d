@@ -13,7 +13,9 @@ A request that would create a wait cycle is rejected.
 
 from __future__ import annotations
 
+import copy
 import threading
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -70,14 +72,25 @@ class SchedulerError(Exception):
     """Domain error (bad request, cycle, illegal state transition...)."""
 
 
+class ReproductionNotFound(SchedulerError):
+    """Reproduction number is unknown in the current round."""
+
+
 class Scheduler:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._builds: dict[str, Build] = {}
         self._workspaces: dict[str, Workspace] = {}
         self._events: list[dict] = []
+        self._journal: list[dict] = []
+        self._reports: dict[str, dict] = {}
         self._seq = 0
         self._tick = 0
+        self._journal_seq = 0
+        self._round_no = 0
+        self._report_seq = 0
+        self._round_id = ""
+        self._initial_workspace_ids: list[str] = []
         self.reset(workspace_ids=["ws-1", "ws-2", "ws-3"])
 
     # ------------------------------------------------------------------ #
@@ -85,11 +98,20 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     def reset(self, workspace_ids: list[str]) -> None:
         with self._lock:
+            self._round_no += 1
+            self._round_id = f"round-{self._round_no}"
+            self._initial_workspace_ids = list(workspace_ids)
             self._builds.clear()
             self._workspaces.clear()
             self._events.clear()
+            self._journal.clear()
+            # Reproduction numbers are scoped to the live round.  Keeping the
+            # global counter monotonic prevents an old number from resolving
+            # to a different report after a reset.
+            self._reports.clear()
             self._seq = 0
             self._tick = 0
+            self._journal_seq = 0
             for wid in workspace_ids:
                 self._workspaces[wid] = Workspace(id=wid)
             self._log("system", message=f"scheduler reset with {len(workspace_ids)} workspaces")
@@ -100,6 +122,11 @@ class Scheduler:
                 raise SchedulerError(f"workspace {workspace_id!r} already exists")
             ws = Workspace(id=workspace_id)
             self._workspaces[workspace_id] = ws
+            self._record_operation(
+                "create_workspace",
+                workspace_id=workspace_id,
+                request={"id": workspace_id},
+            )
             self._log("workspace", workspace_id=workspace_id, message="workspace created")
             return ws
 
@@ -136,6 +163,24 @@ class Scheduler:
                 seq=self._seq,
             )
             self._builds[build_id] = build
+            request = {
+                "id": build_id,
+                "name": name,
+                "base_priority": base_priority,
+                "steps": [
+                    {
+                        "type": step.type.value,
+                        "workspace": step.workspace,
+                        "duration_ms": step.duration_ms,
+                    }
+                    for step in steps
+                ],
+            }
+            self._record_operation(
+                "submit_build",
+                build_id=build_id,
+                request=request,
+            )
             self._log(
                 "build_submitted",
                 build_id=build_id,
@@ -166,12 +211,25 @@ class Scheduler:
             self._release_all(build)
             if up_holder is not None:
                 self._recompute_chain(up_holder)
+            self._record_operation(
+                "cancel_build",
+                build_id=build_id,
+                request={"build_id": build_id},
+                result=self._build_dict(build),
+            )
             return build
 
     # ------------------------------------------------------------------ #
     # The single-executor advance
     # ------------------------------------------------------------------ #
-    def tick(self) -> dict:
+    def tick(
+        self,
+        *,
+        source: str = "tick",
+        batch_id: Optional[str] = None,
+        batch_index: Optional[int] = None,
+        requested_steps: Optional[int] = None,
+    ) -> dict:
         """Advance the highest-effective-priority ready build by one step."""
         with self._lock:
             self._tick += 1
@@ -184,6 +242,16 @@ class Scheduler:
                     "message": "no ready build",
                 }
                 self._log("tick", **result)
+                self._record_operation(
+                    "tick",
+                    request={
+                        "source": source,
+                        "batch_id": batch_id,
+                        "batch_index": batch_index,
+                        "requested_steps": requested_steps,
+                    },
+                    result=result,
+                )
                 return result
 
             build = candidate
@@ -202,15 +270,38 @@ class Scheduler:
                 self._finish(build)
 
             result = {"tick": self._tick, "build_id": build.id, **event}
+            if result.get("cycle") is True:
+                self._attach_reproduction(result, build)
             self._log("step", **result)
+            entry = self._record_operation(
+                "tick",
+                request={
+                    "source": source,
+                    "batch_id": batch_id,
+                    "batch_index": batch_index,
+                    "requested_steps": requested_steps,
+                },
+                result=result,
+            )
+            if result.get("cycle") is True:
+                self._reports[result["reproduction_id"]]["journal_seq"] = entry["seq"]
             return result
 
     def advance(self, steps: int) -> list[dict]:
         if steps < 1:
             raise SchedulerError("steps must be >= 1")
+        # A batch is only a client-side loop.  Each tick takes the scheduler
+        # lock independently, so create/submit/cancel requests arriving from
+        # other threads are journaled in the order they actually take effect.
+        batch_id = f"advance-{uuid.uuid4().hex[:12]}"
         out = []
-        for _ in range(steps):
-            r = self.tick()
+        for index in range(steps):
+            r = self.tick(
+                source="advance",
+                batch_id=batch_id,
+                batch_index=index,
+                requested_steps=steps,
+            )
             out.append(r)
             if r.get("action") == "noop":
                 break
@@ -254,7 +345,8 @@ class Scheduler:
 
         # Contended: reject if the request closes a wait cycle.
         holder = self._builds[ws.held_by]
-        if self._would_cycle(build, holder):
+        cycle_ring = self._cycle_ring(build, holder, ws)
+        if cycle_ring is not None:
             build.status = BuildStatus.FAILED
             build.fail_reason = (
                 f"acquire of {ws.id} held by {holder.id} would create a wait cycle"
@@ -265,6 +357,11 @@ class Scheduler:
                 "workspace_id": ws.id,
                 "granted": False,
                 "cycle": True,
+                "cycle_path": cycle_ring["path"],
+                "ring": cycle_ring["path"],
+                "cycle_order": cycle_ring["path"][:-1],
+                "cycle_ring": cycle_ring,
+                "wait_cycle": cycle_ring,
                 "status": build.status.value,
                 "fail_reason": build.fail_reason,
                 "pc": build.pc,
@@ -352,6 +449,15 @@ class Scheduler:
         self._recompute_chain(holder)
         self._recompute_chain(winner_build)
 
+        # A blocking acquire already consumed its instruction when the build
+        # parked.  If that acquire was the final step, granting it completes
+        # the build immediately rather than leaving pc one past the end.
+        if (
+            winner_build.status == BuildStatus.READY
+            and winner_build.pc >= len(winner_build.steps)
+        ):
+            self._finish(winner_build)
+
     def _release_all(self, build: Build) -> None:
         for wid in list(build.held_workspaces):
             ws = self._workspaces[wid]
@@ -411,6 +517,68 @@ class Scheduler:
             cur = self._holder_waited_on_by(cur)
         return False
 
+    def _cycle_ring(
+        self,
+        requester: Build,
+        holder: Build,
+        requested_ws: Workspace,
+    ) -> Optional[dict]:
+        """Build the alternating build/workspace ring closed by this acquire.
+
+        For A requesting ws-2 held by B, where B waits on ws-1 held by A, the
+        ordered path is ``[A, ws-2, B, ws-1, A]``.  Returns ``None`` when the
+        request does not close a ring.
+        """
+        if not self._would_cycle(requester, holder):
+            return None
+
+        path: list[str] = [requester.id, requested_ws.id, holder.id]
+        build_path: list[str] = [requester.id, holder.id]
+        workspace_path: list[str] = [requested_ws.id]
+        edges: list[dict] = [{
+            "build_id": requester.id,
+            "requests": requested_ws.id,
+            "held_by": holder.id,
+        }]
+
+        cur = holder
+        seen = {holder.id}
+        while cur.id != requester.id:
+            ws_id = cur.waiting_on
+            if ws_id is None or ws_id not in self._workspaces:
+                return None
+            ws = self._workspaces[ws_id]
+            next_holder_id = ws.held_by
+            if next_holder_id is None or next_holder_id in seen:
+                return None
+            next_holder = self._builds[next_holder_id]
+            path.extend([ws_id, next_holder_id])
+            workspace_path.append(ws_id)
+            build_path.append(next_holder_id)
+            edges.append({
+                "build_id": cur.id,
+                "waits_on": ws_id,
+                "held_by": next_holder_id,
+            })
+            if next_holder_id == requester.id:
+                break
+            if next_holder_id in seen:
+                return None
+            seen.add(next_holder_id)
+            cur = next_holder
+
+        return {
+            "failed_build_id": requester.id,
+            "build_ids": build_path,
+            "workspace_ids": workspace_path,
+            "path": path,
+            "nodes": [
+                {"kind": "build" if i % 2 == 0 else "workspace", "id": node}
+                for i, node in enumerate(path)
+            ],
+            "edges": edges,
+        }
+
     def _full_recompute(self) -> None:
         """Recompute every effective priority from scratch (tests/diagnostics)."""
         # Iterate to a fixed point; the wait relation is a forest so this
@@ -436,6 +604,199 @@ class Scheduler:
         if not ready:
             return None
         return min(ready, key=lambda b: (-b.effective_priority, b.seq))
+
+    # ------------------------------------------------------------------ #
+    # Reproduction packages
+    # ------------------------------------------------------------------ #
+    def _attach_reproduction(self, result: dict, build: Build) -> None:
+        self._report_seq += 1
+        reproduction_id = f"repro-{self._report_seq:06d}"
+        result["reproduction_id"] = reproduction_id
+        result["repro_id"] = reproduction_id
+        result["replay_id"] = reproduction_id
+        result["rid"] = reproduction_id
+        result["cycle_id"] = reproduction_id
+        result["reproduction_no"] = self._report_seq
+        result["reproduction_number"] = self._report_seq
+        result["package_url"] = f"/reproductions/{reproduction_id}/package"
+        result["download_url"] = result["package_url"]
+
+        ring = result.get("cycle_ring") or result.get("wait_cycle")
+        self._reports[reproduction_id] = {
+            "reproduction_id": reproduction_id,
+            "repro_id": reproduction_id,
+            "replay_id": reproduction_id,
+            "rid": reproduction_id,
+            "cycle_id": reproduction_id,
+            "reproduction_no": self._report_seq,
+            "reproduction_number": self._report_seq,
+            "round_id": self._round_id,
+            "tick": self._tick,
+            "journal_seq": None,
+            "failed_build_id": build.id,
+            "failed_build": self._build_dict(build),
+            "cycle": ring["path"] if ring else None,
+            "cycle_path": ring["path"] if ring else None,
+            "cycle_ring": ring,
+            "wait_cycle": ring,
+            "last_tick": dict(result),
+        }
+
+    def _record_operation(
+        self,
+        operation_type: str,
+        *,
+        request: Optional[dict] = None,
+        result: Optional[dict] = None,
+        **fields: object,
+    ) -> dict:
+        """Record one externally effective operation in actual lock order."""
+        self._journal_seq += 1
+        entry: dict = {
+            "seq": self._journal_seq,
+            "round_id": self._round_id,
+            "tick": self._tick,
+            # Several aliases make the JSON package easy to consume from
+            # tools that use different vocabulary for the operation type.
+            "type": operation_type,
+            "op": operation_type,
+            "kind": operation_type,
+            **fields,
+        }
+        if request is not None:
+            entry["request"] = request
+        if result is not None:
+            entry["result"] = result
+        self._journal.append(entry)
+        return entry
+
+    def list_reproductions(self) -> list[dict]:
+        with self._lock:
+            return [
+                {
+                    "reproduction_id": report["reproduction_id"],
+                    "repro_id": report["repro_id"],
+                    "replay_id": report["reproduction_id"],
+                    "rid": report["reproduction_id"],
+                    "cycle_id": report["reproduction_id"],
+                    "reproduction_no": report["reproduction_no"],
+                    "reproduction_number": report["reproduction_no"],
+                    "round_id": report["round_id"],
+                    "tick": report["tick"],
+                    "failed_build_id": report["failed_build_id"],
+                    "cycle_path": report["cycle_path"],
+                    "package_url": (
+                        f"/reproductions/{report['reproduction_id']}/package"
+                    ),
+                }
+                for report in self._reports.values()
+            ]
+
+    def get_reproduction_package(self, reproduction_id: str) -> dict:
+        with self._lock:
+            report = self._reports.get(reproduction_id)
+            if report is None:
+                raise ReproductionNotFound(
+                    f"reproduction number {reproduction_id!r} is not available "
+                    "in the current round; reset invalidates old numbers, but "
+                    "a downloaded package can still be posted to /replay"
+                )
+
+            cutoff = report["journal_seq"]
+            operations = copy.deepcopy([
+                entry for entry in self._journal if entry["seq"] <= cutoff
+            ])
+            initial_workspaces = list(self._initial_workspace_ids)
+            tick_results = [
+                copy.deepcopy(entry["result"])
+                for entry in operations
+                if entry["type"] == "tick" and entry.get("result") is not None
+            ]
+            workspace_creations = [
+                copy.deepcopy(entry.get("request") or {"id": entry.get("workspace_id")})
+                for entry in operations
+                if entry["type"] == "create_workspace"
+            ]
+            build_submissions = [
+                copy.deepcopy(entry["request"])
+                for entry in operations
+                if entry["type"] == "submit_build"
+            ]
+            cancellations = [
+                copy.deepcopy(entry.get("request")
+                              or {"build_id": entry.get("build_id")})
+                for entry in operations
+                if entry["type"] == "cancel_build"
+            ]
+            ring = copy.deepcopy(report["cycle_ring"])
+            last_tick = copy.deepcopy(report["last_tick"])
+            failed_build = copy.deepcopy(report["failed_build"])
+            cycle_path = copy.deepcopy(report["cycle_path"])
+
+            failure = {
+                "tick": report["tick"],
+                "build_id": report["failed_build_id"],
+                "failed_build_id": report["failed_build_id"],
+                "failed_build": failed_build,
+                "cycle": True,
+                "cycle_path": cycle_path,
+                "cycle_ring": ring,
+                "wait_cycle": ring,
+                "result": last_tick,
+                "last_tick": last_tick,
+            }
+            return {
+                "schema": "ci-scheduler-reproduction-package/v1",
+                "schema_version": 1,
+                "id": report["reproduction_id"],
+                "package_kind": "ci_scheduler_reproduction_package",
+                "reproduction_id": report["reproduction_id"],
+                "repro_id": report["repro_id"],
+                "replay_id": report["reproduction_id"],
+                "rid": report["reproduction_id"],
+                "cycle_id": report["reproduction_id"],
+                "reproduction_no": report["reproduction_no"],
+                "reproduction_number": report["reproduction_no"],
+                "round_id": report["round_id"],
+                "generated_at_tick": report["tick"],
+                "initial_workspaces": initial_workspaces,
+                "initial_workspace_ids": initial_workspaces,
+                "initial_state": {
+                    "workspace_ids": initial_workspaces,
+                    "workspaces": [{"id": wid} for wid in initial_workspaces],
+                },
+                "operations": operations,
+                "journal": operations,
+                "timeline": operations,
+                "operation_log": operations,
+                # Convenience projections of the same ordered journal.
+                "workspace_creations": workspace_creations,
+                "created_workspaces": workspace_creations,
+                "build_submissions": build_submissions,
+                "submitted_builds": build_submissions,
+                "cancellations": cancellations,
+                "canceled_builds": cancellations,
+                "ticks": tick_results,
+                "advances": tick_results,
+                "tick_results": tick_results,
+                "failure": failure,
+                "cycle_report": failure,
+                "last_tick": last_tick,
+                "failed_build_id": report["failed_build_id"],
+                "failed_build": failed_build,
+                "cycle": cycle_path,
+                "cycle_path": cycle_path,
+                "ring": cycle_path,
+                "cycle_order": cycle_path[:-1] if cycle_path else None,
+                "ordered_nodes": ring.get("nodes") if ring else None,
+                "cycle_build_ids": ring.get("build_ids") if ring else None,
+                "cycle_workspace_ids": ring.get("workspace_ids") if ring else None,
+                "builds_on_cycle": ring.get("build_ids") if ring else None,
+                "workspaces_on_cycle": ring.get("workspace_ids") if ring else None,
+                "cycle_ring": ring,
+                "wait_cycle": ring,
+                "cycle_detected": True,
+            }
 
     # ------------------------------------------------------------------ #
     # Views
@@ -476,6 +837,14 @@ class Scheduler:
             if limit is not None:
                 return events[-limit:]
             return events
+
+    def list_journal(self, limit: Optional[int] = None) -> list[dict]:
+        """Ordered successful operations in the current live round."""
+        with self._lock:
+            operations = copy.deepcopy(self._journal)
+            if limit is not None:
+                return operations[-limit:]
+            return operations
 
     def snapshot(self) -> dict:
         with self._lock:
